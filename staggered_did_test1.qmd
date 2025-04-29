@@ -1,0 +1,140 @@
+---
+title: "did_example_2"
+format: html
+editor: visual
+---
+```{r}
+
+#install.packages("panelView")
+```
+
+```{r}
+
+library("did")
+library("panelView")
+```
+
+
+```{r}
+
+# Set seed
+set.seed(12345)
+
+# Data generating process with 6 time periods after adoption and 1000 observations
+dgp <- reset.sim(
+                time.periods <- 6,
+                n = 1000,
+                ipw = TRUE,
+                reg = TRUE
+                )
+dgp$te <- 0
+
+# Add dynamic effects
+dgp$te.e <- 1:time.periods
+
+# Drop observations where the implementation of the EBP was on period 1. According to Callaway & Sant'Anna, these observations do not help in estimating the ATT(g, t). 
+data1 <- build_sim_dataset(dgp)
+
+# Generate the indicator for adoption across time. If the observation adopts the EBP, they will be coded as 1 at the time of adoption and 1 for all periods after. 
+data1$long[data1$period < data1$G] = 0
+data1$long[data1$period >= data1$G] = 1
+
+# How many observations remained after dropping the observations that had adopted the EBP at time period = 1
+nrow(data1)
+```
+
+
+```{r}
+head(data1)
+```
+```{r}
+### Method 1:
+panelview(
+          data = data1,
+          formula = Y ~ long,            ## Use the formula option
+          index = c("id", "period"),
+          xlab = "Year",
+          ylab = "Unit",
+          display.all = FALSE,
+          gridOff = TRUE,
+          by.timing = TRUE,
+          pre.post = FALSE
+          )
+```
+```{r}
+### Using the outcomes
+panelview(
+          data = data1,
+          formula = Y ~ long,            ## Use the formula option
+          index = c("id", "period"),
+          xlab = "Year",
+          ylab = "Unit",
+          display.all = FALSE,
+          gridOff = TRUE,
+          by.timing = TRUE,
+          pre.post = TRUE,
+          type = "outcome",
+          by.cohort = TRUE,
+          color = c("gray", "blue", "red")
+)
+```
+
+```{r}
+# Estimate the group-time ATT of implementing the EBP controlling for the X covariate
+att_grouptime <- att_gt(yname = "Y",
+                        tname = "period",
+                        idname = "id",
+                        gname = "G",
+                        xformla = ~ X,
+                        data = data1
+)
+
+# Summarize the results
+summary(att_grouptime)
+```
+
+```{r}
+# plot the results
+ggdid(att_grouptime, ylim = c(-1, 6)) # Standardize the y-axis range
+```
+
+```{r}
+### Estimate the group-time ATT of implementing the EBP controlling for the X covariate
+att_grouptime <- att_gt(yname = "Y",
+                        tname = "period",
+                        idname = "id",
+                        gname = "G",
+                        xformla = ~ X,
+                        data = data1
+                        )
+
+### Aggregate the ATT for the different groups with various implementation time periods. 
+att_aggregate <- aggte(att_grouptime, type = "dynamic")
+summary(att_aggregate)
+```
+
+```{r}
+## Plot the cs staggered DID results
+ggdid(att_aggregate)
+```
+
+```{r}
+### Estimate the group-time ATT of implementing the EBP controlling for the X covariate
+att_grouptime_notyet <- att_gt(yname = "Y",
+                        tname = "period",
+                        idname = "id",
+                        gname = "G",
+                        xformla = ~ X,
+                        control_group = "notyettreated",
+                        data = data1
+                        )
+
+### Aggregate the ATT for the different groups with various implementation time periods. 
+att_aggregate_notyet <- aggte(att_grouptime_notyet, type = "dynamic")
+summary(att_aggregate_notyet)
+```
+
+```{r}
+ggdid(att_aggregate_notyet)
+```
+
