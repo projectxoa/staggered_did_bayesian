@@ -83,7 +83,6 @@ panelview(
 
 STAGGERED DID WITH CONTROL GROUP (NEVER TREATED)
 
-
 ```{r}
 # Estimate the group-time ATT of implementing the EBP controlling for the X covariate
 att_grouptime <- att_gt(yname = "Y",
@@ -130,8 +129,6 @@ data1_no_control <- data1 %>%
   filter(treat == 1)
 ```
 
-
-
 ```{r}
 ### Estimate the group-time ATT of implementing the EBP controlling for the X covariate
 att_grouptime_notyet <- att_gt(yname = "Y",
@@ -145,13 +142,10 @@ att_grouptime_notyet <- att_gt(yname = "Y",
                         )
 ```
 
-
 ```{r}
 # plot the results
 ggdid(att_grouptime_notyet, ylim = c(-1, 6), ncol = 4) # Standardize the y-axis range
 ```
-
-
 
 ```{r}
 ### Aggregate the ATT for the different groups with various implementation time periods. 
@@ -159,21 +153,11 @@ att_aggregate_notyet <- aggte(att_grouptime_notyet, type = "dynamic")
 summary(att_aggregate_notyet)
 ```
 
-
-
-
 ```{r}
 ggdid(att_aggregate_notyet)
 ```
 
-
-
-
-
-
 POWER ANALYSIS STAGGERED DID WITH ONLY "NOTYETTREATED"
-
-
 
 ```{r}
 
@@ -209,11 +193,6 @@ generate_data <- function(tp, n_obs, effect_scale = 1) {
   return(data_sim)
 }
 ```
-
-
-
-
-
 
 ```{r}
 # --- Power Analysis Setup ---
@@ -277,10 +256,6 @@ run_single_power_simulation <- function(tp, n_obs, effect_scale, alpha = 0.05, c
 }
 ```
 
-
-
-
-
 ```{r}
 # --- Run the Power Simulation ---
 
@@ -311,8 +286,6 @@ simulation_results <- replicate(B, run_single_power_simulation(
 
 ```
 
-
-
 ```{r}
 # Calculate Power
 # Power is the proportion of successful simulations that yielded a significant result
@@ -330,7 +303,6 @@ if (successful_simulations > 0) {
 ```
 
 ADAPTED POWER ANALYSIS
-
 
 ```{r}
 # --- Run the Power Simulation ---
@@ -359,7 +331,6 @@ set.seed(4567)
 cat(sprintf("Starting power simulations (B=%d) for control group '%s'...\n", B, control_group_choice))
 
 ```
-
 
 ```{r}
 # Loop through each effect scale
@@ -410,7 +381,6 @@ if (abs(type_I_error - alpha_level) > 0.02) { # Arbitrary threshold for warning
 
 ```
 
-
 ```{r}
 # Find approximate MDE for 80% power
 target_power <- 0.80
@@ -446,7 +416,6 @@ if (!is.na(mde_index)) {
 
 ```
 
-
 ```{r}
 # Plot Power Curve
 plot(scales_to_test, power_results, type = "b", pch = 19,
@@ -461,4 +430,3 @@ text(max(scales_to_test)*0.8, target_power + 0.05, sprintf("%.0f%% Power Target"
 text(max(scales_to_test)*0.8, alpha_level + 0.05, sprintf("Alpha = %.2f", alpha_level), col="blue")
 grid()
 ```
-
