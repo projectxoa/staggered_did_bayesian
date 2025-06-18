@@ -3,22 +3,21 @@ title: "did_example_2"
 format: html
 editor: visual
 ---
-```{r}
-
-#install.packages("panelView")
-```
 
 ```{r}
 
 library("did")
 library("panelView")
+library("dplyr")
+library("tidyverse")
 ```
-
 
 ```{r}
 
 # Set seed
 set.seed(12345)
+
+effect_scale <- 0.5
 
 # Data generating process with 6 time periods after adoption and 1000 observations
 dgp <- reset.sim(
@@ -30,10 +29,12 @@ dgp <- reset.sim(
 dgp$te <- 0
 
 # Add dynamic effects
-dgp$te.e <- 1:time.periods
+dgp$te.e <- 1:time.periods * effect_scale
 
 # Drop observations where the implementation of the EBP was on period 1. According to Callaway & Sant'Anna, these observations do not help in estimating the ATT(g, t). 
 data1 <- build_sim_dataset(dgp)
+
+data1$long <- 0
 
 # Generate the indicator for adoption across time. If the observation adopts the EBP, they will be coded as 1 at the time of adoption and 1 for all periods after. 
 data1$long[data1$period < data1$G] = 0
@@ -43,10 +44,10 @@ data1$long[data1$period >= data1$G] = 1
 nrow(data1)
 ```
 
-
 ```{r}
 head(data1)
 ```
+
 ```{r}
 ### Method 1:
 panelview(
@@ -61,6 +62,7 @@ panelview(
           pre.post = FALSE
           )
 ```
+
 ```{r}
 ### Using the outcomes
 panelview(
@@ -79,6 +81,9 @@ panelview(
 )
 ```
 
+STAGGERED DID WITH CONTROL GROUP (NEVER TREATED)
+
+
 ```{r}
 # Estimate the group-time ATT of implementing the EBP controlling for the X covariate
 att_grouptime <- att_gt(yname = "Y",
@@ -95,7 +100,7 @@ summary(att_grouptime)
 
 ```{r}
 # plot the results
-ggdid(att_grouptime, ylim = c(-1, 6)) # Standardize the y-axis range
+ggdid(att_grouptime, ylim = c(-1, 6), ncol = 5) # Standardize the y-axis range
 ```
 
 ```{r}
@@ -118,6 +123,15 @@ summary(att_aggregate)
 ggdid(att_aggregate)
 ```
 
+STAGGERED DID WITH ONLY "NOTYETTREATED" AS CONTROL GROUP
+
+```{r}
+data1_no_control <- data1 %>% 
+  filter(treat == 1)
+```
+
+
+
 ```{r}
 ### Estimate the group-time ATT of implementing the EBP controlling for the X covariate
 att_grouptime_notyet <- att_gt(yname = "Y",
@@ -126,15 +140,325 @@ att_grouptime_notyet <- att_gt(yname = "Y",
                         gname = "G",
                         xformla = ~ X,
                         control_group = "notyettreated",
-                        data = data1
+                        clustervars = "cluster",
+                        data = data1_no_control
                         )
+```
 
+
+```{r}
+# plot the results
+ggdid(att_grouptime_notyet, ylim = c(-1, 6), ncol = 4) # Standardize the y-axis range
+```
+
+
+
+```{r}
 ### Aggregate the ATT for the different groups with various implementation time periods. 
 att_aggregate_notyet <- aggte(att_grouptime_notyet, type = "dynamic")
 summary(att_aggregate_notyet)
 ```
 
+
+
+
 ```{r}
 ggdid(att_aggregate_notyet)
+```
+
+
+
+
+
+
+POWER ANALYSIS STAGGERED DID WITH ONLY "NOTYETTREATED"
+
+
+
+```{r}
+
+# Define DGP parameters
+time_periods_val <- 6
+n_val <- 1000
+
+# Define a function to generate one dataset based on parameters
+# This makes it easier to call within the simulation loop
+generate_data <- function(tp, n_obs, effect_scale = 1) {
+  # Use the did package's simulation setup
+  dgp_sim <- reset.sim(
+    time.periods = tp,
+    n = n_obs,
+    ipw = TRUE, # Include propensity score weighting setup
+    reg = TRUE  # Include outcome regression setup
+  )
+
+  # Set the *hypothesized* true effect for the power simulation
+  dgp_sim$te <- 0 # Average effect often set to 0 when dynamic effects are specified
+  base_dynamic_effect <- 1:tp # Your original dynamic effect pattern
+  dgp_sim$te.e <- base_dynamic_effect * effect_scale # Allow scaling the effect size
+  
+  # Build the dataset
+  data_sim <- build_sim_dataset(dgp_sim)
+
+  # Generate the 'long' indicator (post-treatment indicator)
+  data_sim$long <- 0
+  # Need to handle cases where G is NA (never-treated)
+  valid_g <- !is.na(data_sim$G)
+  data_sim$long[valid_g & (data_sim$period[valid_g] >= data_sim$G[valid_g])] = 1
+
+  return(data_sim)
+}
+```
+
+
+
+
+
+
+```{r}
+# --- Power Analysis Setup ---
+
+# Function to run a single simulation iteration and return significance
+run_single_power_simulation <- function(tp, n_obs, effect_scale, alpha = 0.05, control_group_opt = "notyettreated", xformula_opt = ~X) {
+
+  # 1. Generate data with the specified effect size
+  data_sim <- generate_data(tp = tp, n_obs = n_obs, effect_scale = effect_scale)
+
+  # 2. Estimate ATT(g,t) - use tryCatch for robustness in simulations
+  att_gt_sim <- tryCatch({
+    att_gt(yname = "Y",
+           tname = "period",
+           idname = "id",
+           gname = "G",
+           xformla = xformula_opt,
+           control_group = control_group_opt, # "nevertreated" or "notyettreated"
+           data = data_sim,
+           est_method = "dr", # Doubly robust is often preferred
+           base_period = "universal") # Or "varying"
+  }, error = function(e) {
+    # message("Error in att_gt: ", e$message) # Optional: print errors
+    NULL # Return NULL if estimation fails
+  })
+
+  # If att_gt failed, this simulation iteration is unsuccessful
+  if (is.null(att_gt_sim)) {
+    return(NA) # Indicate failure
+  }
+
+  # 3. Aggregate to get dynamic effects - use tryCatch
+  att_agg_sim <- tryCatch({
+    aggte(att_gt_sim, type = "dynamic", na.rm = TRUE) # na.rm is important for aggregation
+  }, error = function(e) {
+    # message("Error in aggte: ", e$message) # Optional: print errors
+    NULL # Return NULL if aggregation fails
+  })
+
+  # If aggte failed, this simulation iteration is unsuccessful
+  if (is.null(att_agg_sim)) {
+    return(NA)
+  }
+
+  # 4. Check significance of the overall dynamic effect estimate
+  # We need the overall ATT estimate and its standard error
+  overall_att <- att_agg_sim$overall.att
+  overall_se <- att_agg_sim$overall.se
+
+  # Check if results are valid
+  if (is.na(overall_att) || is.na(overall_se) || overall_se <= 0) {
+    return(NA) # Indicate invalid result
+  }
+
+  # Calculate p-value using a standard normal approximation (z-statistic)
+  z_stat <- overall_att / overall_se
+  p_value <- 2 * pnorm(-abs(z_stat))
+
+  # 5. Return TRUE if significant, FALSE otherwise
+  return(p_value < alpha)
+}
+```
+
+
+
+
+
+```{r}
+# --- Run the Power Simulation ---
+
+# Simulation Parameters
+B <- 100       # Number of simulations (Increase to 1000+ for more stable results)
+alpha_level <- 0.05
+n_sim <- n_val  # Sample size used in simulation
+tp_sim <- time_periods_val # Time periods used in simulation
+
+# Hypothesized effect size for which power is being calculated
+# effect_scale = 1.0 means we test power for the original effect te.e = 1:6
+# effect_scale = 0.5 would test power for te.e = 0.5, 1.0, ..., 3.0
+hypothesized_effect_scale <- 1
+
+# Set seed for reproducibility of the *entire simulation*
+set.seed(4567)
+
+# Run the simulations
+# `replicate` simplifies running the function B times
+simulation_results <- replicate(B, run_single_power_simulation(
+                                     tp = tp_sim,
+                                     n_obs = n_sim,
+                                     effect_scale = hypothesized_effect_scale,
+                                     alpha = alpha_level,
+                                     control_group_opt = "nevertreated", # Or "notyettreated"
+                                     xformula_opt = ~X # Include covariates
+                                    ))
+
+```
+
+
+
+```{r}
+# Calculate Power
+# Power is the proportion of successful simulations that yielded a significant result
+successful_simulations <- sum(!is.na(simulation_results))
+significant_simulations <- sum(simulation_results, na.rm = TRUE)
+
+if (successful_simulations > 0) {
+  estimated_power <- significant_simulations / successful_simulations
+  cat(sprintf("Based on %d successful simulations (out of %d total):\n", successful_simulations, B))
+  cat(sprintf("Estimated Power to detect an effect scaled by %.2f: %.3f\n",
+              hypothesized_effect_scale, estimated_power))
+} else {
+  cat(sprintf("All %d simulations failed. Check the simulation function and parameters.\n", B))
+}
+```
+
+ADAPTED POWER ANALYSIS
+
+
+```{r}
+# --- Run the Power Simulation ---
+
+# Simulation Parameters
+B <- 500       # Number of simulations (Increased for stability)
+alpha_level <- 0.05
+n_sim <- n_val  # Sample size used in simulation (1000)
+tp_sim <- time_periods_val # Time periods used in simulation (6)
+
+# Explicitly choose the control group for the power analysis
+control_group_choice <- "nevertreated" # Or "notyettreated"
+
+# Define a range of effect scales to test
+# Include 0 to check Type I error rate
+# Span values likely to include where power crosses 80%
+scales_to_test <- c(0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.75, 1.0)
+
+# Initialize vector to store power results
+power_results <- numeric(length(scales_to_test))
+names(power_results) <- scales_to_test
+
+# Set seed for reproducibility of the *entire simulation process*
+set.seed(4567)
+
+cat(sprintf("Starting power simulations (B=%d) for control group '%s'...\n", B, control_group_choice))
+
+```
+
+
+```{r}
+# Loop through each effect scale
+for (i in 1:length(scales_to_test)) {
+  current_scale <- scales_to_test[i]
+  cat(sprintf("  Running for effect_scale = %.2f ... ", current_scale))
+
+  # Run the B simulations for the current scale
+  simulation_results <- replicate(B, run_single_power_simulation(
+                                       tp = tp_sim,
+                                       n_obs = n_sim,
+                                       effect_scale = current_scale,
+                                       alpha = alpha_level,
+                                       control_group_opt = control_group_choice,
+                                       xformula_opt = ~X
+                                      ))
+
+  # Calculate power for the current scale
+  successful_simulations <- sum(!is.na(simulation_results))
+  significant_simulations <- sum(simulation_results, na.rm = TRUE)
+
+  if (successful_simulations > 0) {
+     power_results[i] <- significant_simulations / successful_simulations
+     cat(sprintf("Power = %.3f (%d/%d successful)\n", power_results[i], successful_simulations, B))
+  } else {
+     power_results[i] <- NA # Mark as failed if all simulations failed
+     cat("All simulations failed!\n")
+  }
+}
+
+cat("Power simulation finished.\n\n")
+```
+
+```{r}
+# --- Analyze and Display Results ---
+
+# Print the power for each tested scale
+print("Estimated Power by Effect Scale:")
+print(round(power_results, 3))
+
+# Check Type I error rate (power when scale is 0)
+type_I_error <- power_results["0"]
+cat(sprintf("\nEstimated Type I Error Rate (Power at scale=0): %.3f (Target: %.3f)\n",
+            type_I_error, alpha_level))
+if (abs(type_I_error - alpha_level) > 0.02) { # Arbitrary threshold for warning
+    cat("Warning: Estimated Type I error rate deviates noticeably from alpha.\nConsider increasing B or checking for estimation issues (e.g., glm.fit warnings during run).\n")
+}
+
+```
+
+
+```{r}
+# Find approximate MDE for 80% power
+target_power <- 0.80
+mde_index <- which(power_results >= target_power)[1] # Find first scale >= target
+
+if (!is.na(mde_index)) {
+  mde_scale <- scales_to_test[mde_index]
+  # Optional: Interpolate for a potentially smoother MDE estimate
+  # (Requires at least one point above and below target_power)
+  lower_index <- max(which(power_results < target_power))
+  if(mde_index > 1 && !is.na(lower_index) && lower_index < mde_index) {
+      power_low <- power_results[lower_index]
+      power_high <- power_results[mde_index]
+      scale_low <- scales_to_test[lower_index]
+      scale_high <- scales_to_test[mde_index]
+      # Linear interpolation
+      mde_scale_interp <- scale_low + (scale_high - scale_low) * (target_power - power_low) / (power_high - power_low)
+      cat(sprintf("\nApproximate Minimum Detectable Effect Scale (for %.0f%% power): %.3f (interpolated: %.3f)\n",
+                  target_power*100, mde_scale, mde_scale_interp))
+      cat(sprintf("(This corresponds to dynamic effects starting around %.3f and increasing)\n",
+                  (1:tp_sim)[1] * mde_scale_interp))
+  } else {
+       cat(sprintf("\nApproximate Minimum Detectable Effect Scale (for %.0f%% power): %.3f\n",
+                   target_power*100, mde_scale))
+       cat(sprintf("(This corresponds to dynamic effects starting around %.3f and increasing)\n",
+                  (1:tp_sim)[1] * mde_scale))
+  }
+
+} else {
+  cat(sprintf("\nCould not achieve %.0f%% power within the tested effect size scales (max power = %.3f).\n",
+              target_power*100, max(power_results, na.rm=TRUE)))
+}
+
+```
+
+
+```{r}
+# Plot Power Curve
+plot(scales_to_test, power_results, type = "b", pch = 19,
+     xlab = "Effect Size Scale (multiplier for 1:6 base effect)",
+     ylab = "Estimated Power",
+     main = sprintf("Power Curve (N=%d, T=%d, B=%d, Control=%s)", n_sim, tp_sim, B, control_group_choice),
+     ylim = c(0, 1), xaxt = "n")
+axis(1, at = scales_to_test, labels = scales_to_test) # Ensure all tested scales are labeled
+abline(h = target_power, lty = 2, col = "red")
+abline(h = alpha_level, lty = 2, col = "blue")
+text(max(scales_to_test)*0.8, target_power + 0.05, sprintf("%.0f%% Power Target", target_power*100), col="red")
+text(max(scales_to_test)*0.8, alpha_level + 0.05, sprintf("Alpha = %.2f", alpha_level), col="blue")
+grid()
 ```
 
