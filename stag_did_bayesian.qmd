@@ -9,17 +9,25 @@ editor: visual
 #install.packages("brms")
 library("brms")
 library("tidyverse") # For data manipulation
+library("did")
+library("panelView")
+library("dplyr")
+library("tidyverse")
+library("cobalt")
+library("furrr")
+library("future")
+#install.packages("future")
 ```
 
 ```{r}
 # Set seed
 set.seed(12345)
 
-effect_scale <- 0.5
+effect_scale <- 1
 
 # Data generating process with 6 time periods after adoption and 1000 observations
 dgp <- reset.sim(
-                time.periods <- 6,
+                time.periods <- 5,
                 n = 1000,
                 ipw = TRUE,
                 reg = TRUE
@@ -161,16 +169,25 @@ priors_revised <- c(
 )
 control_settings <- list(adapt_delta = 0.95)
 
+# Add this to your data preparation chunk, right after creating data_cs
+data_cs <- data_cs %>%
+  mutate(
+    # This new variable allows the time trend to be different for different values of X
+    X_trend = X * period
+  )
+
 # Fit the fully interacted model
 brm_fit_cs <- brm(
-  formula = Y ~ time_fct + (1|id) + X + cohort * event_time_fct, # Changed to '*'
+  # Add X (for the level effect) and X_trend (for the differential trend)
+  formula = Y ~ (1|id) + X + X_trend + cohort * event_time_fct,
+  
   data = data_cs,
   prior = priors_revised,
   control = control_settings,
   family = gaussian(),
   cores = 4,
   seed = 12345,
-  file = "brms_did_cs_v2" # Use a new file
+  file = "brms_did_final_v2" # A new file for the final model
 )
 ```
 
@@ -272,3 +289,530 @@ ggplot(dynamic_effects_correct, aes(x = event_time, y = Estimate)) +
   ) +
   theme_minimal()
 ```
+
+
+
+________________________________________________
+
+Approach 3: Iterative Approach per Cohort
+
+
+
+
+
+```{r}
+# --- Generate a NEW, simplified dataset ---
+set.seed(12345)
+dgp_simple <- reset.sim(
+    time.periods = 6,
+    n = 1000,
+    ipw = FALSE,  # <-- CHANGE: No selection bias based on X
+    reg = FALSE   # <-- CHANGE: Outcome Y does not depend on X
+)
+dgp_simple$te <- 0
+dgp_simple$te.e <- 1:time.periods * effect_scale
+data_simple <- build_sim_dataset(dgp_simple)
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(brms)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr) # A useful package for working with lists
+
+# --- Step 1: Identify Treatment Cohorts ---
+# Get a sorted, unique list of all actual treatment cohorts (G > 1, as G=1 was dropped)
+cohorts_to_loop <- sort(unique(data1$G[data1$G > 1]))
+print("Cohorts to be analyzed:")
+print(cohorts_to_loop)
+
+
+# --- Step 2: Set up a list to store results ---
+all_cohort_results <- list()
+```
+
+
+```{r}
+# --- Step 3-5: Loop through each cohort to run a separate analysis ---
+
+# This loop will take a significant amount of time to run, as it fits
+# one Bayesian model for each cohort.
+for (g in cohorts_to_loop) {
+
+  cat(paste("\n--- Processing Cohort G =", g, "---\n"))
+
+  # --- a. Prepare the data subset for the current cohort ---
+  data_subset <- data1 %>%
+    filter(G == g | G == 0 | G > g)
+
+  # --- b. Create analysis variables for this specific subset ---
+  data_subset <- data_subset %>%
+    mutate(
+      treat = ifelse(G == g, 1, 0),
+      event_time = case_when(
+        treat == 1 ~ as.character(period - G),
+        TRUE       ~ "Control"
+      ),
+      # --- THIS IS THE CORRECTED LINE ---
+      event_time_fct = factor(event_time) %>% relevel(ref = "-1"),
+      # --------------------------------
+      X_trend = X * period
+    )
+
+  # --- c. Run the Bayesian model on the subset ---
+  cat("Fitting model...\n")
+  brm_cohort_fit <- brm(
+    formula = Y ~ (1|id) + X + X_trend + event_time_fct,
+    data = data_subset,
+    prior = priors_revised,
+    control = control_settings,
+    family = gaussian(),
+    cores = 4,
+    seed = 12345,
+    silent = 2
+  )
+
+  # --- d. Extract and store the posterior draws for this cohort ---
+  cat("Extracting results...\n")
+  cohort_draws <- posterior::as_draws_df(brm_cohort_fit) %>%
+    select(.draw, starts_with("b_event_time_fct")) %>%
+    select(-contains("-")) %>%
+    pivot_longer(
+      cols = -".draw",
+      names_to = "event_time_fct",
+      values_to = "att_draw",
+      names_prefix = "b_event_time_fct"
+    ) %>%
+    mutate(
+      cohort = g,
+      event_time = as.numeric(event_time_fct)
+    )
+
+  all_cohort_results[[as.character(g)]] <- cohort_draws
+}
+```
+
+
+```{r}
+# --- Step 6: Combine Results from All Cohorts ---
+cat("\n--- All cohorts processed. Aggregating final results... ---\n")
+
+all_draws_combined <- bind_rows(all_cohort_results, .id = "cohort_id")
+
+
+# --- Step 7: Aggregate and Plot the Final Results ---
+dynamic_effects_iterative <- all_draws_combined %>%
+  group_by(event_time) %>%
+  summarise(
+    Estimate = mean(att_draw),
+    Q2.5 = quantile(att_draw, 0.025),
+    Q97.5 = quantile(att_draw, 0.975),
+    .groups = "drop"
+  )
+
+dynamic_effects_iterative <- bind_rows(
+  dynamic_effects_iterative,
+  tibble(event_time = -1, Estimate = 0, Q2.5 = 0, Q97.5 = 0)
+) %>% arrange(event_time)
+
+print(
+  ggplot(dynamic_effects_iterative, aes(x = event_time, y = Estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 3, color = "darkgreen") +
+    geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2, color = "darkgreen") +
+    labs(
+      title = "Bayesian Dynamic Effects (Iterative Method)",
+      subtitle = "Effects are averaged from separate cohort-specific models (CS Logic)",
+      x = "Time Relative to Treatment",
+      y = "Average Treatment Effect on the Treated"
+    ) +
+    theme_minimal()
+)
+```
+
+
+```{r}
+# --- Diagnostic Test: Isolate G=2 vs. G=0, No Covariates ---
+
+# 1. Create the simplest, cleanest dataset possible
+diagnostic_data <- data1 %>%
+  filter(G %in% c(0, 2)) %>%
+  mutate(
+    # Simple treatment dummy
+    treat = ifelse(G == 2, 1, 0),
+    # Simple event time for the one treated group
+    event_time = ifelse(treat == 1, as.character(period - G), "Control"),
+    event_time_fct = factor(event_time) %>% relevel(ref = "-1")
+  )
+
+# 2. Fit the simplest possible Bayesian DiD model
+# NO covariates, not even the trend fix. No cohort interactions.
+# We also remove (1|period) because in a 2-group DiD, it is
+# collinear with the group dummy and event_time dummies.
+cat("--- Running simple diagnostic model ---\n")
+
+brm_diagnostic_fit <- brm(
+  formula = Y ~ (1|id) + event_time_fct,
+  data = diagnostic_data,
+  family = gaussian(),
+  cores = 4,
+  seed = 12345,
+  silent = 2
+)
+
+# 3. Extract and plot the results from this simple model
+diagnostic_effects <- posterior::as_draws_df(brm_diagnostic_fit) %>%
+  select(.draw, starts_with("b_event_time_fct")) %>%
+  pivot_longer(
+    cols = -".draw",
+    names_to = "event_time_fct",
+    values_to = "effect",
+    names_prefix = "b_event_time_fct"
+  ) %>%
+  mutate(event_time = as.numeric(event_time_fct)) %>%
+  filter(!is.na(event_time)) %>% # Filter out any non-numeric levels if they sneak in
+  group_by(event_time) %>%
+  summarise(
+    Estimate = mean(effect),
+    Q2.5 = quantile(effect, 0.025),
+    Q97.5 = quantile(effect, 0.975),
+    .groups = "drop"
+  )
+
+diagnostic_effects <- bind_rows(
+  diagnostic_effects,
+  tibble(event_time = -1, Estimate = 0, Q2.5 = 0, Q97.5 = 0)
+) %>% arrange(event_time)
+
+# 4. Plot the diagnostic result
+print(
+  ggplot(diagnostic_effects, aes(x = event_time, y = Estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 3, color = "red") +
+    geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2, color = "red") +
+    labs(
+      title = "Diagnostic Test: G=2 vs. Never-Treated (No Covariates)",
+      x = "Time Relative to Treatment",
+      y = "Treatment Effect Estimate"
+    ) +
+    theme_minimal()
+)
+```
+
+Approach 4: Simpler Data Generation and complexity
+
+
+```{r}
+# --- Generate a NEW, simplified dataset ---
+set.seed(12345)
+dgp_simple <- reset.sim(
+    time.periods = 6,
+    n = 1000,
+    ipw = FALSE,  # <-- CHANGE: No selection bias based on X
+    reg = FALSE   # <-- CHANGE: Outcome Y does not depend on X
+)
+dgp_simple$te <- 0
+dgp_simple$te.e <- 1:time.periods * effect_scale
+data_simple <- build_sim_dataset(dgp_simple)
+```
+
+
+```{r}
+# Get cohorts and set up storage list
+cohorts_to_loop_simple <- sort(unique(data_simple$G[data_simple$G > 1]))
+all_cohort_results_final <- list()
+```
+
+
+```{r}
+# Loop through each cohort
+for (g in cohorts_to_loop_simple) {
+
+  cat(paste("\n--- Processing Cohort G =", g, "(Definitive Model) ---\n"))
+
+  # Prepare subset for this cohort and its clean controls
+  data_subset <- data_simple %>%
+    filter(G == g | G == 0 | G > g) %>%
+    mutate(
+      # Simple dummy: 1 if in the current cohort `g`, 0 otherwise
+      treat = factor(ifelse(G == g, 1, 0)),
+      # Simple factor for the absolute time period
+      period_fct = factor(period)
+    )
+
+  # Run the Bayesian model with the standard, correct DiD interaction formula
+  brm_fit_object <- brm(
+    formula = Y ~ (1|id) + treat * period_fct,
+    data = data_subset,
+    family = gaussian(),
+    # Priors can help stabilize the model
+    prior = c(prior(normal(0, 5), class = "b")),
+    # Use robust control settings
+    control = list(adapt_delta = 0.99),
+    iter = 4000,
+    cores = 4,
+    seed = 12345,
+    silent = 2
+  )
+
+  # Extract draws ONLY for the interaction terms `treat1:period_fct...`
+  # These are our DiD estimates for each time period
+  cohort_draws <- posterior::as_draws_df(brm_fit_object) %>%
+    select(.draw, starts_with("b_treat1:period_fct")) %>%
+    pivot_longer(
+      cols = -".draw",
+      names_to = "term",
+      values_to = "att_draw"
+    ) %>%
+    # The effect is relative to when treatment starts (period g)
+    mutate(
+      period = as.numeric(str_extract(term, "[0-9]+$")),
+      event_time = period - g,
+      cohort = g
+    ) %>%
+    # Keep only post-treatment effects
+    filter(event_time >= 0)
+
+  all_cohort_results_final[[as.character(g)]] <- cohort_draws
+}
+```
+
+
+```{r}
+# --- Aggregate and Plot (This code block is unchanged) ---
+cat("\n--- All cohorts processed. Aggregating final results... ---\n")
+
+all_draws_combined_final <- bind_rows(all_cohort_results_final)
+dynamic_effects_final <- all_draws_combined_final %>%
+  group_by(event_time) %>%
+  summarise(
+    Estimate = mean(att_draw),
+    Q2.5 = quantile(att_draw, 0.025),
+    Q97.5 = quantile(att_draw, 0.975),
+    .groups = "drop"
+  )
+
+```
+
+
+
+```{r}
+
+dynamic_effects_final <- bind_rows(
+  dynamic_effects_final,
+  tibble(event_time = -1, Estimate = 0, Q2.5 = 0, Q97.5 = 0)
+) %>% arrange(event_time)
+
+# Plot the final, correct results
+print(
+  ggplot(dynamic_effects_final, aes(x = event_time, y = Estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 3, color = "purple") +
+    geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2, color = "purple") +
+    labs(
+      title = "Final Bayesian Dynamic Effects (Correct DiD Specification)",
+      subtitle = "Model includes both Unit and Time Fixed Effects on Simple Data",
+      x = "Time Relative to Treatment",
+      y = "Average Treatment Effect on the Treated"
+    ) +
+    theme_minimal()
+)
+```
+
+
+
+_________________________________________
+
+
+Complex with AIPW
+
+
+
+
+```{r}
+# --- Stage 1: Propensity Score Estimation ---
+
+# Generate the realistic, complex dataset
+set.seed(12345)
+dgp_realistic <- reset.sim(
+    time.periods = 5,
+    n = 500,
+    ipw = TRUE,  # <-- Realistic: Selection bias based on X
+    reg = TRUE   # <-- Realistic: Outcome Y depends on X
+)
+dgp_realistic$te <- 0
+dgp_realistic$te.e <- 1:time.periods * effect_scale
+data_realistic <- build_sim_dataset(dgp_realistic)
+
+# We need a factor version of the cohort variable `G` for the model
+# We'll also combine never-treated (G=0) and not-yet-treated into a single "control" category
+# for the purpose of this selection model, which simplifies things.
+# For modeling, we need one observation per unit `id`.
+propensity_data <- data_realistic %>%
+  distinct(id, G, X) %>%
+  mutate(G_factor = factor(G))
+
+# Fit a Bayesian multinomial model to estimate P(G | X)
+# This model learns how X predicts which cohort a unit will be in.
+propensity_model <- brm(
+  formula = G_factor ~ X,
+  data = propensity_data,
+  family = categorical(), # This specifies a multinomial model
+  cores = 4,
+  seed = 12345,
+  silent = 2,
+  file = "propensity_model" # Cache the model
+)
+
+# Predict the probability for each unit belonging to its ACTUAL observed cohort
+# This gives us the propensity scores.
+prop_scores <- fitted(propensity_model, newdata = propensity_data, summary = FALSE)
+```
+
+
+```{r}
+# `prop_scores` is an array: [draws, cases, categories]
+# We need to extract the probability corresponding to the actual cohort for each unit
+# This is a bit complex, but this code works:
+propensity_data$prop_score <- map_dbl(1:nrow(propensity_data), function(i) {
+  # For unit i, find its actual cohort level
+  actual_cohort_level <- which(levels(propensity_data$G_factor) == propensity_data$G_factor[i])
+  # Get the mean probability across all posterior draws for that unit and that cohort
+  mean(prop_scores[, i, actual_cohort_level])
+})
+```
+
+
+```{r}
+# Calculate the IPW weights. The simplest form is 1 / P(treatment received)
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight = 1 / prop_score)
+
+# Join the weights back to the main longitudinal dataset
+data_weighted <- data_realistic %>%
+  left_join(propensity_data %>% select(id, ipw_weight), by = "id")
+```
+
+
+```{r}
+
+# Assess the balance on the covariate X across the treatment cohorts G
+# We compare the unweighted data with the IPW-weighted data.
+balance_assessment <- bal.tab(
+  G ~ X,                               # Formula: treatment variable ~ covariates
+  data = data_weighted,                # The dataset to use
+  weights = "ipw_weight",              # The column containing the IPW weights
+  method = "weighting",                # Specify that we are using weights
+  un = TRUE,                           # Display balance for the unweighted data as well
+  estimand = "ATE"                     # We are estimating the Average Treatment Effect
+)
+
+# Print the balance table
+print(balance_assessment)
+
+# Generate the Love Plot
+love.plot(
+  balance_assessment,
+  threshold = 0.1,                     # Add a line for the 0.1 SMD threshold
+  title = "Covariate Balance Before and After IPW",
+  stars = "raw"
+)
+
+
+cat("\n--- Stage 1 Complete: Propensity scores and weights calculated. ---\n")
+```
+
+
+
+
+```{r}
+# --- Stage 2: Weighted Outcome Model ---
+
+# Set up a parallel processing plan. This will use 4 cores.
+# The plan is "sticky", so you only need to run this once per session.
+plan(multisession, workers = 4)
+
+cohorts_to_loop <- sort(unique(data_weighted$G[data_weighted$G > 1]))
+
+# Replace the for() loop with future_map()
+# `future_map_dfr` will run the code for each cohort in parallel
+# and combine the resulting data frames at the end.
+all_cohort_results_df <- future_map_dfr(cohorts_to_loop, .f = function(g) {
+
+  cat(paste("\n--- Processing Cohort G =", g, "(Corrected Weighted Model) ---\n"))
+
+  # --- Your existing logic from inside the loop goes here ---
+
+  data_subset <- data_weighted %>%
+    filter(G == g | G == 0 | G > g) %>%
+    mutate(
+      treat = factor(ifelse(G == g, 1, 0)),
+      period_fct = factor(period)
+    )
+
+  brm_weighted_fit <- brm(
+    formula = Y | weights(ipw_weight) ~ (1|id) + (1|period) + treat:period_fct, # <-- WEIGHTS ARE BACK IN
+    data = data_subset,
+    family = gaussian(),
+    prior = c(prior(normal(0, 1), class = "b")),  # <-- KEEP THE STRONG PRIOR
+    control = list(adapt_delta = 0.99),
+    iter = 2000,                                 # <-- KEEP THE HIGHER ITERATIONS
+    cores = 1,
+    seed = 12345,
+    silent = 2
+)
+
+  cohort_draws <- posterior::as_draws_df(brm_weighted_fit) %>%
+    select(.draw, starts_with("b_treat1:period_fct")) %>%
+    pivot_longer(cols = -".draw", names_to = "term", values_to = "att_draw") %>%
+    mutate(
+      period = as.numeric(str_extract(term, "[0-9]+$")),
+      event_time = period - g,
+      cohort = g
+    ) %>%
+    filter(event_time >= 0)
+
+  # Return the results for this cohort
+  return(cohort_draws)
+
+}, .options = furrr_options(seed = TRUE)) # Ensures reproducibility
+
+cat("\n--- All Cohorts Processed in Parallel ---\n")
+
+```
+
+
+```{r}
+# --- Aggregate and Plot (This code block is unchanged) ---
+cat("\n--- All cohorts processed. Aggregating final results... ---\n")
+
+all_draws_combined_weighted <- bind_rows(all_cohort_results_weighted)
+dynamic_effects_weighted <- all_draws_combined_weighted %>%
+  group_by(event_time) %>%
+  summarise(
+    Estimate = mean(att_draw), Q2.5 = quantile(att_draw, 0.025), Q97.5 = quantile(att_draw, 0.975), .groups = "drop"
+  )
+dynamic_effects_weighted <- bind_rows(
+  tibble(event_time = -1, Estimate = 0, Q2.5 = 0, Q97.5 = 0),
+  dynamic_effects_weighted
+) %>% arrange(event_time)
+
+print(
+  ggplot(dynamic_effects_weighted, aes(x = event_time, y = Estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_point(size = 3, color = "darkblue") +
+    geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2, color = "darkblue") +
+    labs(
+      title = "Final Results with Inverse Probability Weighting",
+      subtitle = "Bayesian model using IPW to control for selection bias",
+      x = "Time Relative to Treatment", y = "Average Treatment Effect on the Treated"
+    ) +
+    theme_minimal()
+)
+```
+
+
