@@ -1,0 +1,181 @@
+---
+title: "stag_did_bayesian_v4"
+output: html_document
+date: "2025-06-26"
+---
+
+```{r}
+install.packages("brms")
+```
+
+
+```{r}
+# Load necessary libraries
+library(brms)
+library(did)
+library(cobalt)
+library(furrr)
+library(future)
+library(tidyverse)
+```
+
+
+```{r}
+set.seed(12345)
+
+# Define simulation parameters
+effect_scale <- 1.5
+time_periods <- 6
+n_obs <- 500
+
+# Data generating process
+dgp <- reset.sim(
+  time.periods = time_periods,
+  n = n_obs,
+  ipw = TRUE, # Include selection bias
+  reg = TRUE  # Include confounding
+)
+
+# Set a fixed (constant) treatment effect instead of a dynamic one
+dgp$te.e <- 0 
+dgp$te <- effect_scale
+
+# Build the final dataset
+data_df <- build_sim_dataset(dgp)
+
+cat(paste("Generated dataset with", nrow(data_df), "rows.\n"))
+```
+
+
+```{r}
+# --- Propensity Score Estimation ---
+
+# Create dataset for propensity model (one row per unit)
+propensity_data <- data_df %>%
+  distinct(id, G, X) %>%
+  mutate(G_factor = factor(G))
+
+# Fit a multinomial model to estimate P(G | X)
+propensity_model <- brm(
+  formula = G_factor ~ X,
+  data = propensity_data,
+  family = categorical(),
+  cores = 4,
+  seed = 12345,
+  silent = 2,
+  file = "propensity_model" # Cache model to save time
+)
+
+# Predict probabilities for each unit belonging to its actual cohort
+prop_scores <- fitted(propensity_model, newdata = propensity_data, summary = FALSE)
+```
+
+
+```{r}
+# Extract the mean posterior probability for each unit's actual observed cohort
+propensity_data$prop_score <- purrr::map_dbl(1:nrow(propensity_data), function(i) {
+  actual_cohort_level <- which(levels(propensity_data$G_factor) == propensity_data$G_factor[i])
+  mean(prop_scores[, i, actual_cohort_level])
+})
+
+# Calculate raw weights and investigate their distribution
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight = 1 / prop_score)
+
+hist(propensity_data$ipw_weight, breaks = 100, main = "Histogram of Original IPW Weights")
+
+# Trim extreme weights by capping at the 99th percentile
+weight_cap <- quantile(propensity_data$ipw_weight, 0.99, na.rm = TRUE)
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight_trimmed = ifelse(ipw_weight > weight_cap, weight_cap, ipw_weight))
+
+cat(paste("\nWeights capped at the 99th percentile:", round(weight_cap, 2), "\n"))
+
+# Join the final weights back to the main longitudinal dataset
+data_weighted <- data_df %>%
+  left_join(propensity_data %>% select(id, ipw_weight, ipw_weight_trimmed), by = "id")
+```
+
+
+```{r}
+# --- Assess Covariate Balance ---
+
+# Use cobalt to compare balance from original vs. trimmed weights
+balance_assessment <- bal.tab(
+  G ~ X,
+  data = data_weighted,
+  weights = list(Untrimmed = "ipw_weight", Trimmed = "ipw_weight_trimmed"),
+  method = "weighting",
+  un = TRUE
+)
+
+print(balance_assessment)
+love.plot(
+  balance_assessment,
+  threshold = 0.1,
+  title = "Covariate Balance: Unweighted vs. Weighted",
+  sample.names = c("Unweighted", "Untrimmed Weights", "Trimmed Weights"),
+  stars = "raw"
+)
+```
+
+
+```{r}
+# Set up parallel processing
+plan(multisession, workers = 4)
+
+cohorts_to_loop <- sort(unique(data_weighted$G[data_weighted$G > 1]))
+
+# Use future_map_dfr to run the analysis for each cohort in parallel
+all_cohort_results_df <- future_map_dfr(cohorts_to_loop, .f = function(g) {
+  
+  cat(paste("\nProcessing Cohort G =", g, "\n"))
+
+  # Create subset for cohort g vs. its controls
+  data_subset <- data_weighted %>%
+    filter(G == g | G == 0 | G > g) %>%
+    mutate(treat = factor(ifelse(G == g, 1, 0)))
+
+  # This DiD model estimates a single, constant treatment effect ('treat')
+  brm_weighted_fit <- brm(
+    formula = Y | weights(ipw_weight_trimmed) ~ (1|id) + (1|period) + treat,
+    data = data_subset,
+    family = gaussian(),
+    prior = c(prior(normal(0, 2.5), class = "b")),
+    control = list(adapt_delta = 0.99),
+    iter = 2000,
+    cores = 1,
+    seed = 12345,
+    silent = 2
+  )
+
+  # Extract draws for the single ATT coefficient 'b_treat1'
+  cohort_draws <- posterior::as_draws_df(brm_weighted_fit) %>%
+    select(att_draw = b_treat1) %>%
+    mutate(cohort = g)
+
+  return(cohort_draws)
+
+}, .options = furrr_options(seed = TRUE))
+```
+
+
+```{r}
+# Summarize the posterior draws from all models
+fixed_effect_summary <- all_cohort_results_df %>%
+  summarise(
+    Estimate = mean(att_draw),
+    Std.Error = sd(att_draw), # Posterior standard deviation
+    `Q2.5` = quantile(att_draw, 0.025),
+    `Q97.5` = quantile(att_draw, 0.975)
+  )
+
+# Print the final summary table
+print(fixed_effect_summary)
+```
+
+
+
+
+
+

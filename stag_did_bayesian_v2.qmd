@@ -1,0 +1,239 @@
+---
+title: "Bayesian Staggered DID"
+format: html
+editor: visual
+---
+
+```{r}
+# Load the necessary libraries
+#install.packages("brms")
+library("brms")
+library("tidyverse") # For data manipulation
+library("did")
+library("panelView")
+library("dplyr")
+library("tidyverse")
+library("cobalt")
+library("furrr")
+library("future")
+#install.packages("future")
+```
+
+```{r}
+# --- STAGE 1: DATA GENERATION & PROPENSITY SCORE ESTIMATION ---
+
+# --- Part 1: Data Generation ---
+
+# Set seed for reproducibility
+set.seed(12345)
+
+# Define simulation parameters clearly
+effect_scale <- 1.5
+time_periods <- 6 # Use a single, consistent value for time periods
+n_obs <- 500    # Use a single, consistent value for n
+
+# Data generating process
+dgp <- reset.sim(
+    time.periods = time_periods,
+    n = n_obs,
+    ipw = TRUE, # Retain TRUE for realistic selection bias
+    reg = TRUE  # Retain TRUE for realistic confounding
+)
+
+#dgp$te <- 0
+
+# Add dynamic treatment effects
+# Note: The 'time.periods' variable from the function call doesn't persist,
+# so we use our defined 'time_periods' variable.
+dgp$te.e <- 0   # 1:time_periods * effect_scale
+dgp$te <- effect_scale
+
+# Build the single, definitive dataset for the entire analysis
+data_df <- build_sim_dataset(dgp)
+
+# Generate the indicator for adoption across time.
+# If an observation adopts the EBP, it's coded as 1 at that time and for all subsequent periods.
+data_df$long <- 0
+data_df$long[data_df$period < data_df$G] <- 0
+data_df$long[data_df$period >= data_df$G] <- 1
+
+cat(paste("Generated a single dataset with", nrow(data_df), "rows.\n"))
+```
+
+
+
+```{r}
+# --- Part 2: Propensity Score Estimation ---
+# This part now uses the 'data_df' object created above.
+
+# For modeling, we need one observation per unit `id` with their cohort G and covariate X.
+propensity_data <- data_df %>%
+  distinct(id, G, X) %>%
+  mutate(G_factor = factor(G))
+
+# Fit a Bayesian multinomial model to estimate P(G | X).
+# This model learns how the covariate X predicts cohort assignment.
+propensity_model <- brm(
+  formula = G_factor ~ X,
+  data = propensity_data,
+  family = categorical(), # Specifies a multinomial model
+  cores = 4,
+  seed = 12345,
+  silent = 2,
+  file = "propensity_model" # Cache the model to save time on re-runs
+)
+
+# Predict the probability for each unit belonging to its ACTUAL observed cohort.
+# These are the propensity scores.
+prop_scores <- fitted(propensity_model, newdata = propensity_data, summary = FALSE)
+
+cat("--- Stage 1 Complete: Propensity scores estimated. ---\n")
+```
+
+
+```{r}
+# --- STAGE 2: WEIGHT CALCULATION, TRIMMING, AND ASSESSMENT ---
+
+# --- Part 1: Extract Propensity Scores and Calculate Raw IPW ---
+
+# Extract the mean posterior probability for each unit's actual observed cohort
+propensity_data$prop_score <- purrr::map_dbl(1:nrow(propensity_data), function(i) {
+  actual_cohort_level <- which(levels(propensity_data$G_factor) == propensity_data$G_factor[i])
+  mean(prop_scores[, i, actual_cohort_level])
+})
+
+# Calculate the raw IPW weights from the propensity scores
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight = 1 / prop_score)
+
+
+# --- Part 2: Investigate and Trim the Weights ---
+
+cat("\n--- Summary of Original IPW Weights ---\n")
+print(summary(propensity_data$ipw_weight))
+
+# Visualize the distribution to identify extreme weights in the right tail
+hist(propensity_data$ipw_weight, breaks = 100, main = "Histogram of Original IPW Weights")
+
+# Trim the weights by capping them at the 99th percentile to improve stability
+weight_cap <- quantile(propensity_data$ipw_weight, 0.99, na.rm = TRUE)
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight_trimmed = ifelse(ipw_weight > weight_cap, weight_cap, ipw_weight))
+
+cat(paste("\n--- Weights are being capped at the 99th percentile:", round(weight_cap, 2), "---\n"))
+cat("--- Summary of Trimmed IPW Weights ---\n")
+print(summary(propensity_data$ipw_weight_trimmed))
+
+
+# --- Part 3: Join Final Weights to Longitudinal Data ---
+
+# Join the processed weights back to the main longitudinal dataset
+# We select id and both weight columns for potential comparison later.
+data_weighted <- data_df %>%
+  left_join(propensity_data %>% select(id, ipw_weight, ipw_weight_trimmed), by = "id")
+
+
+# --- Part 4: Assess Covariate Balance ---
+
+# Use cobalt to assess balance achieved by both the original and trimmed weights
+balance_assessment <- bal.tab(
+  G ~ X,
+  data = data_weighted,
+  # Provide both sets of weights to bal.tab for a direct comparison
+  weights = list(Untrimmed = "ipw_weight", Trimmed = "ipw_weight_trimmed"),
+  method = "weighting",
+  un = TRUE,
+  estimand = "ATE"
+)
+
+# Print the detailed balance table
+print(balance_assessment)
+
+# Generate a Love Plot to visually compare the balance from both weighting schemes
+love.plot(
+  balance_assessment,
+  threshold = 0.1,
+  title = "Covariate Balance: Unweighted vs. Weighted",
+  sample.names = c("Unweighted", "Untrimmed Weights", "Trimmed Weights"),
+  stars = "raw"
+)
+
+cat("\n--- Stage 2 Complete: Final weights calculated, joined, and assessed. ---\n")
+
+```
+
+
+
+
+```{r}
+# --- STAGE 3: WEIGHTED OUTCOME MODEL (WITH FIXED EFFECT FORMULA) ---
+
+# Ensure the parallel processing plan is set
+plan(multisession, workers = 4)
+
+cohorts_to_loop <- sort(unique(data_weighted$G[data_weighted$G > 1]))
+
+all_cohort_results_df <- future_map_dfr(cohorts_to_loop, .f = function(g) {
+
+  cat(paste("\n--- Processing Cohort G =", g, " (Fixed Effect Model) ---\n"))
+
+  # Data subsetting remains the same
+  data_subset <- data_weighted %>%
+    filter(G == g | G == 0 | G > g) %>%
+    mutate(
+      treat = factor(ifelse(G == g, 1, 0)),
+      # period_fct is no longer needed in the formula but doesn't hurt to keep
+      period_fct = factor(period)
+    )
+
+  # --- THIS IS THE KEY FORMULA CHANGE ---
+  brm_weighted_fit <- brm(
+    # The formula now estimates a single coefficient for 'treat'
+    formula = Y | weights(ipw_weight_trimmed) ~ (1|id) + (1|period) + treat,
+    data = data_subset,
+    family = gaussian(),
+    prior = c(prior(normal(0, 2.5), class = "b")), # A reasonable prior for a fixed effect
+    control = list(adapt_delta = 0.99),
+    iter = 1000,
+    cores = 1,
+    seed = 12345
+    #,    silent = 2
+  )
+  # ------------------------------------
+
+  # --- POST-PROCESSING IS NOW MUCH SIMPLER ---
+  # We extract draws for the single coefficient 'b_treat1'
+  cohort_draws <- posterior::as_draws_df(brm_weighted_fit) %>%
+    select(att_draw = b_treat1) %>% # Select and rename the coefficient for the treatment effect
+    mutate(cohort = g) # Add the cohort identifier
+
+  return(cohort_draws)
+  # ------------------------------------------
+
+}, .options = furrr_options(seed = TRUE))
+
+cat("\n--- All Cohorts Processed in Parallel ---\n")
+
+```
+
+
+```{r}
+# --- STAGE 4: AGGREGATE AND SUMMARIZE FINAL RESULTS ---
+
+cat("\n--- Aggregating final results for the fixed effect model... ---\n")
+
+# The output `all_cohort_results_df` is a data frame of all posterior draws
+# for the ATT from every cohort-specific model. We can now summarize them.
+fixed_effect_summary <- all_cohort_results_df %>%
+  summarise(
+    Estimate = mean(att_draw),
+    Std.Error = sd(att_draw), # The posterior standard deviation
+    Q2.5 = quantile(att_draw, 0.025),
+    Q97.5 = quantile(att_draw, 0.975)
+  )
+
+# Print the final summary table
+print(fixed_effect_summary)
+```
+
+
