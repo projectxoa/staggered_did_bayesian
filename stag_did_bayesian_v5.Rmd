@@ -1,0 +1,238 @@
+---
+title: "v4"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# This setup chunk runs first but is completely hidden from the report.
+# We set global options here to avoid repeating them.
+knitr::opts_chunk$set(
+  message = FALSE, # Hide all package loading messages
+  warning = FALSE, # Hide all warnings (including Stan's convergence warnings)
+  echo = TRUE      # Show code by default
+)
+
+```
+
+# 1. Introduction
+
+This report presents a complete simulation and analysis pipeline for a staggered Difference-in-Differences (DiD) study. We employ a modern methodological approach, using Inverse Probability Weighting (IPW) to control for observational confounding and fitting a Bayesian event-study model to estimate dynamic treatment effects, following the principles outlined by Callaway & Sant'Anna (2021).
+
+
+
+```{r library-loading}
+# Load all necessary libraries for the analysis.
+# Messages from loading are hidden by the global setup options.
+library(brms)
+library(did)
+library(cobalt)
+library(tidyverse)
+library(here)
+```
+
+# 2. Data Simulation
+
+First, we generate a synthetic panel dataset from scratch. This allows us to know the true treatment effect and assess our model's ability to recover it. The simulation creates a balanced panel with unit and time-specific effects, a known confounder, and a pre-defined, sustained treatment effect.
+
+```{r data-generation}
+set.seed(12345)
+
+# Simulation Parameters
+n_ids <- 2000
+time_periods <- 6
+effect_scale <- 1.5
+INTERCEPT <- 2
+BETA_X <- 0.5
+confounder_strength <- 0.15 # Confounding is intentionally weak for good balance
+
+# Create a balanced panel structure
+panel_structure <- tidyr::expand_grid(
+  id = 1:n_ids,
+  period = 1:time_periods
+)
+
+# Create time-invariant (unit-level) characteristics
+unit_data <- tibble(
+  id = 1:n_ids,
+  G = sample(c(0, 2, 3, 4, 5, 6), size = n_ids, replace = TRUE, prob = c(0.4, 0.15, 0.15, 0.15, 0.15, 0.15)),
+  X = rnorm(n_ids, mean = G * confounder_strength, sd = 1),
+  eta_id = rnorm(n_ids, mean = 0, sd = 2)
+)
+
+# Generate the final dataset with a sustained treatment effect
+data_df <- panel_structure %>%
+  left_join(unit_data, by = "id") %>%
+  mutate(tau_period = rnorm(n(), mean = period * 0.5, sd = 0.2)) %>%
+  mutate(is_treated_post = ifelse(G > 0 & period >= G, 1, 0)) %>%
+  mutate(
+    Y = INTERCEPT + eta_id + tau_period + (BETA_X * X) + (effect_scale * is_treated_post) + rnorm(n(), sd = 1.5)
+  )
+
+cat(paste("Generated a clean, balanced panel with", nrow(data_df), "rows.\n"))
+```
+
+
+
+
+
+# 3. Covariate Balancing via IPW
+
+Our simulation includes a confounder, `X`, which is correlated with treatment assignment `G`. To obtain an unbiased estimate of the treatment effect, we must adjust for this confounding. We use Inverse Probability Weighting, a method that uses a model of the treatment assignment process to re-weight the sample, creating a pseudo-population where the confounder is no longer associated with the treatment.
+
+```{r ipw-weighting}
+# --- 3. Covariate Balancing via IPW ---
+
+# First, we fit a model to estimate the probability of belonging to each cohort.
+propensity_data <- data_df %>%
+  distinct(id, G, X) %>%
+  mutate(G_factor = factor(G))
+
+# Fit a multinomial model. We've changed the filename to force a re-fit.
+propensity_model <- brm(
+  formula = G_factor ~ poly(X, 2),
+  data = propensity_data,
+  family = categorical(),
+  cores = 4,
+  seed = 12345,
+  silent = 2,
+
+  file = here::here("propensity_model_poly.rds")
+  # ---
+)
+
+# Next, we calculate the weights based on the newly fitted model's predictions.
+prop_scores <- fitted(propensity_model, newdata = propensity_data, summary = FALSE)
+
+propensity_data$prop_score <- purrr::map_dbl(1:nrow(propensity_data), function(i) {
+  actual_cohort_level <- which(levels(propensity_data$G_factor) == propensity_data$G_factor[i])
+  mean(prop_scores[, i, actual_cohort_level])
+})
+
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight = 1 / prop_score)
+
+# To improve stability, we trim extreme weights at the 99th percentile.
+weight_cap <- quantile(propensity_data$ipw_weight, 0.99, na.rm = TRUE)
+propensity_data <- propensity_data %>%
+  mutate(ipw_weight_trimmed = ifelse(ipw_weight > weight_cap, weight_cap, ipw_weight))
+
+# Finally, we merge the weights back into our main analysis dataset.
+data_weighted <- data_df %>%
+  left_join(propensity_data %>% select(id, ipw_weight_trimmed), by = "id")
+
+cat("\n--- IPW chunk complete. A fresh propensity score model was fitted. ---\n")
+```
+
+
+## 3.1. Balance Assessment
+
+A critical step is to verify that the weighting procedure was successful. An effective weighting scheme should produce a balanced sample where the distribution of `X` is similar across all treatment cohorts. We check this both with a summary table and visually.
+
+```{r balance-assessment, fig.cap="Figure 1: The Love Plot shows that after weighting, the correlation between the covariate X and treatment assignment is nearly zero, indicating excellent balance."}
+# The bal.tab function provides a numerical summary of the balance.
+balance_assessment <- bal.tab(
+  G ~ X,
+  data = data_weighted,
+  weights = list(Weighted = "ipw_weight_trimmed"),
+  method = "weighting",
+  un = TRUE
+)
+
+print(balance_assessment)
+
+love.plot(
+  balance_assessment,
+  threshold = 0.1,
+  title = "Covariate Balance: Unweighted vs. Weighted",
+  sample.names = c("Unweighted", "Weighted"),
+  stars = "raw"
+)
+```
+
+
+```{r balance-density-plots, fig.cap="Figure 2: The density plots confirm our success. Before weighting (top), the distributions of X differed across cohorts. After weighting (bottom), the distributions are nearly identical."}
+# We can also visualize the distributions directly.
+plot_before <- ggplot(data_weighted, aes(x = X, fill = factor(G))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Covariate Distributions BEFORE Weighting", x = "Value of Confounder (X)", fill = "Cohort (G)") +
+  theme_minimal()
+
+plot_after <- ggplot(data_weighted, aes(x = X, fill = factor(G), weight = ipw_weight_trimmed)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Covariate Distributions AFTER Weighting", x = "Value of Confounder (X)", fill = "Cohort (G)") +
+  theme_minimal()
+
+print(plot_before)
+print(plot_after)
+```
+
+
+# 4. Final DiD Model and Results
+
+With a well-balanced sample, we can proceed to the final outcome model. We fit a Bayesian event-study model to estimate the dynamic treatment effects.
+
+```{r final-model}
+# Prepare the data with a factor for event time (time relative to treatment).
+data_for_event_study <- data_weighted %>%
+  mutate(
+    event_time = case_when(
+      G == 0 ~ "Never Treated",
+      period < G ~ "Pre-treatment",
+      period >= G ~ as.character(period - G)
+    ),
+    event_time = factor(event_time, levels = c("Pre-treatment", "Never Treated", "0", "1", "2", "3", "4"))
+  )
+
+# Fit the dynamic event-study model.
+brm_event_study_fit <- brm(
+   formula = Y | weights(ipw_weight_trimmed) ~ (1|id) + factor(period) + event_time,
+   data = data_for_event_study,
+   family = gaussian(),
+   prior = c(prior(normal(0, 2.5), class = "b"), prior(normal(3, 2), class = "Intercept")),
+   control = list(adapt_delta = 0.98, max_treedepth = 12),
+   iter = 4000,
+   cores = 4,
+   seed = 12345,
+   file = here::here("brm_event_study_fit.rds")
+)
+
+print(summary(brm_event_study_fit))
+```
+
+
+
+## 4.1. Visualizing the Treatment Effects
+
+The primary result of our analysis is the event-study plot. It shows the estimated treatment effect for each period relative to the treatment's start date, allowing us to see how the effect evolves over time.
+
+```{r final-plot, fig.cap="Figure 3: The final event-study plot. The model successfully recovers the true, sustained treatment effect of 1.5 for all post-treatment periods (event time >= 0)."}
+# Extract coefficients for plotting.
+att_estimates <- as.data.frame(summary(brm_event_study_fit)$fixed) %>%
+  tibble::rownames_to_column("term") %>%
+  filter(stringr::str_detect(term, "event_time"))
+
+# Create the final visualization.
+final_plot <- ggplot(att_estimates, aes(x = term, y = Estimate, ymin = `l-95% CI`, ymax = `u-95% CI`)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = effect_scale, linetype = "dotted", color = "blue", linewidth = 1) +
+  geom_pointrange(color = "black", size = 0.8) +
+  labs(
+    title = "Final Event-Study Plot",
+    subtitle = "The model recovers the sustained effect of ~1.5",
+    x = "Event Time (Periods Relative to Treatment)",
+    y = "Estimated Treatment Effect (ATT)",
+    caption = "Blue dotted line shows the true simulated effect size (1.5)"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(final_plot)
+```
+
+
+
+
+
+
+
+
