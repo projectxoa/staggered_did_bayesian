@@ -1,0 +1,140 @@
+---
+title: |-
+  Something with staggered diff in diff
+subtitle: Very funny something
+short-title: A good summary thingy
+correspondence-prefix: "Correspondence concerning this article should be addressed to"
+author:
+  - name: Shiva Faeghinezhad
+    email: s.faeghinezhad@utwente.nl
+    orcid: 0000-0002-2140-056X
+    title: Assistant Professor
+    affiliations: 
+      - ref: utwente
+  - name: Marc Heinle
+    email: marc.heinle@utwente.nl
+    orcid: 
+    title: PhD student
+    affiliations: 
+      - ref: utwente
+  - name: Misja Mikkers
+    email: m.c.mikkers@utwente.nl
+    orcid: 0009-0003-0042-0531
+    title: Professor
+    affiliations: 
+      - id: utwente
+        name: University of Twente
+        department: Health Technology & Services Research
+        city: Enschede
+        region: Overijssel
+        country: Netherlands
+        postal-code: 7500AE
+    attributes:
+      corresponding: true
+abstract: |
+  Abstract and more abstract text here. This is a placeholder for the abstract of the paper. It should summarize the main findings and contributions of the research in a concise manner, typically in 150-250 words.
+thanks: |-
+  We would like to thank XXX for his valuable suggestions and feedback on this project.
+additional-info: |-
+  We have no known conflict of interest to disclose.
+keywords:
+  - Bayesian
+  - Calloway Sant'Anna
+  - Staggered DiD
+  - And more
+  - healthcare systems
+date: today
+lang: nl
+bibliography: references.bib
+format:
+  hikmah-pdf:
+    default:
+    number-sections: true
+---
+\newpage
+
+# Introduction
+
+
+```{r settings, eval = TRUE, warning = FALSE, message = FALSE, echo = FALSE}
+
+# Load libraries
+
+library(tidyverse)
+
+
+# settings
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+
+```
+
+
+@callaway2021difference have proposed a new approach to estimate the treatment effect in staggered difference-in-differences (DiD) settings. We will try to replicate their results using a Bayesian estimation approach.
+
+[@baker2025difference]
+
+# Data 
+
+```{r}
+# Data creation
+
+set.seed(1279)
+
+# Setup
+n_practices <- 15
+n_months <- 72  # 6 years of monthly data, treatment starts at month 36
+
+# Practice-level metadata
+gp_info <- tibble(
+  gp_id = 1:n_practices,
+  n_patients = sample(2300:3500, n_practices, replace = TRUE),
+  baseline_prob = rnorm(n_practices, mean = 0.05, sd = 0.005)
+)
+
+# Assign treatment status and the starting month of the treatment
+
+treated_ids <- sample(gp_info$gp_id, 10)
+treatment_months <- sample(36:54, 10, replace = TRUE)
+treatment_info <- tibble(
+  gp_id = treated_ids,
+  treat_month = treatment_months
+)
+
+gp_info <- gp_info %>%
+  left_join(treatment_info, by = "gp_id") %>%
+  mutate(treated = if_else(!is.na(treat_month), 1, 0))
+
+# Generate monthly data
+
+monthly_data <- expand_grid(
+  gp_id = 1:n_practices,
+  month = 1:n_months
+) %>%
+  left_join(gp_info, by = "gp_id") %>%
+  mutate(
+    treated_yet = if_else(!is.na(treat_month) & month >= treat_month, 1, 0),
+    prob = if_else(treated_yet == 1, baseline_prob * (1 - 0.3), baseline_prob)
+  )
+
+
+# Simulate patient-level referrals
+patient_data <- monthly_data %>%
+  rowwise() %>%
+  mutate(
+    patient_id = list(1:n_patients),
+    referral = list(rbinom(n_patients, size = 1, prob = prob))
+  ) %>%
+  unnest(c(patient_id, referral)) %>%
+  mutate(
+    patient_id = paste0("gp", gp_id, "_p", patient_id)
+  )
+
+```
+
+
+
+\newpage
+
+# References
+
